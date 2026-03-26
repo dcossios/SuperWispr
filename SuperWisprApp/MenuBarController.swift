@@ -2,6 +2,21 @@ import AppKit
 import SwiftUI
 import os
 
+func debugLog(_ message: String) {
+    let logDir = NSHomeDirectory() + "/Library/Logs/superWispr"
+    try? FileManager.default.createDirectory(atPath: logDir, withIntermediateDirectories: true)
+    let logPath = logDir + "/debug.log"
+    let timestamp = ISO8601DateFormatter().string(from: Date())
+    let line = "[\(timestamp)] \(message)\n"
+    if let handle = FileHandle(forWritingAtPath: logPath) {
+        handle.seekToEndOfFile()
+        handle.write(line.data(using: .utf8)!)
+        handle.closeFile()
+    } else {
+        FileManager.default.createFile(atPath: logPath, contents: line.data(using: .utf8))
+    }
+}
+
 /// Owns the NSStatusItem, coordinates hotkey → record → transcribe → paste flow.
 @MainActor
 final class MenuBarController {
@@ -18,10 +33,12 @@ final class MenuBarController {
     private let minimumRecordingDuration: TimeInterval = 0.5
     private var accessibilityTimer: Timer?
     private var hotkeyActive = false
+    private var targetAppPID: pid_t?
 
     private let appState = AppState.shared
 
     init() {
+        debugLog("MenuBarController.init()")
         setupStatusItem()
         setupHotkey()
         startServer()
@@ -148,6 +165,8 @@ final class MenuBarController {
                 appState.serverReady = true
                 appState.loadedModel = UserDefaults.standard.string(forKey: "selectedModel")
                     ?? "openai/whisper-large-v3-turbo"
+                appState.recordingState = .idle
+                updateIcon(for: .idle)
                 logger.info("Server is ready")
             } else {
                 appState.recordingState = .error("Server failed to start")
@@ -166,21 +185,14 @@ final class MenuBarController {
         hotkeyManager.onKeyUp = { [weak self] in
             Task { @MainActor in self?.stopRecordingAndTranscribe() }
         }
-        hotkeyManager.onStatusChange = { [weak self] active in
-            Task { @MainActor in
-                self?.hotkeyActive = active
-                NSLog("[superWispr] Hotkey active: \(active)")
-            }
-        }
+        debugLog("AXIsProcessTrusted: \(AXIsProcessTrusted())")
 
-        // Always attempt to start — HotkeyManager tries CGEvent tap first,
-        // then falls back to NSEvent global monitor
         hotkeyManager.start()
+        hotkeyActive = hotkeyManager.isActive
+        debugLog("Hotkey setup done, isActive=\(hotkeyActive)")
 
-        if !hotkeyManager.isActive {
-            NSLog("[superWispr] Hotkey not active, requesting Accessibility permission")
+        if !AXIsProcessTrusted() {
             HotkeyManager.requestAccessibilityPermission()
-            startAccessibilityPolling()
         }
     }
 
@@ -208,8 +220,9 @@ final class MenuBarController {
     // MARK: - Recording Flow
 
     private func startRecording() {
+        debugLog("startRecording() called, serverReady=\(appState.serverReady), state=\(String(describing: appState.recordingState))")
         guard appState.serverReady else {
-            logger.warning("Cannot record: server not ready")
+            debugLog("Cannot record: server not ready")
             NSSound.beep()
             return
         }
@@ -218,6 +231,8 @@ final class MenuBarController {
         appState.recordingState = .recording
         updateIcon(for: .recording)
         recordingStartTime = Date()
+        targetAppPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        debugLog("Target app PID captured: \(targetAppPID.map(String.init) ?? "none")")
 
         if UserDefaults.standard.bool(forKey: "soundFeedback") {
             NSSound(named: "Tink")?.play()
@@ -282,7 +297,8 @@ final class MenuBarController {
                 }
 
                 appState.lastTranscription = result.text
-                clipboardManager.pasteText(result.text)
+                clipboardManager.pasteText(result.text, targetAppPID: targetAppPID)
+                targetAppPID = nil
 
                 appState.recordingState = .idle
                 updateIcon(for: .idle)
@@ -299,6 +315,7 @@ final class MenuBarController {
                 }
             }
 
+            targetAppPID = nil
             audioRecorder.cleanup()
         }
     }

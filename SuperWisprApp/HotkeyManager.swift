@@ -2,46 +2,33 @@ import Cocoa
 import Carbon
 import os
 
-/// Captures a global hold-to-record hotkey via NSEvent global monitor + CGEvent tap.
-/// Default: Ctrl+Option (⌃⌥). Falls back to NSEvent monitoring if CGEvent tap fails.
+/// Captures a global hold-to-record hotkey.
+/// Uses both CGEvent tap and NSEvent monitor for maximum compatibility.
+/// Default hotkey: Ctrl+Option (⌃⌥).
 final class HotkeyManager {
     var onKeyDown: (() -> Void)?
     var onKeyUp: (() -> Void)?
-    var onStatusChange: ((Bool) -> Void)?
 
     fileprivate var eventTap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
     private var globalMonitor: Any?
     private var localMonitor: Any?
     private var keyIsDown = false
-    private let logger = Logger(subsystem: "com.superwispr", category: "HotkeyManager")
 
     private(set) var isActive = false
 
     func start() {
         guard !isActive else { return }
 
-        // Try CGEvent tap first (most reliable for global hotkeys)
-        if tryStartEventTap() {
-            NSLog("[superWispr] Hotkey active via CGEvent tap")
-            isActive = true
-            onStatusChange?(true)
-            return
-        }
+        // Set up CGEvent tap (works best with Accessibility permission)
+        let tapOK = tryStartEventTap()
+        debugLog("CGEvent tap created: \(tapOK)")
 
-        // Fall back to NSEvent global monitor
-        NSLog("[superWispr] CGEvent tap failed, trying NSEvent global monitor")
+        // Always also set up NSEvent monitor as backup/complement
         startNSEventMonitor()
+        debugLog("NSEvent monitors installed")
 
-        if globalMonitor != nil {
-            NSLog("[superWispr] Hotkey active via NSEvent monitor")
-            isActive = true
-            onStatusChange?(true)
-        } else {
-            NSLog("[superWispr] All hotkey methods failed — need Accessibility permission")
-            isActive = false
-            onStatusChange?(false)
-        }
+        isActive = true
     }
 
     func stop() {
@@ -88,7 +75,7 @@ final class HotkeyManager {
         return true
     }
 
-    // MARK: - NSEvent Monitor (fallback)
+    // MARK: - NSEvent Monitor
 
     private func startNSEventMonitor() {
         globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: .flagsChanged) {
@@ -103,16 +90,9 @@ final class HotkeyManager {
     }
 
     private func handleNSFlagsChanged(_ event: NSEvent) {
-        let flags = event.modifierFlags
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         let active = flags.contains(.control) && flags.contains(.option)
-
-        if active && !keyIsDown {
-            keyIsDown = true
-            DispatchQueue.main.async { self.onKeyDown?() }
-        } else if !active && keyIsDown {
-            keyIsDown = false
-            DispatchQueue.main.async { self.onKeyUp?() }
-        }
+        processKeyState(active)
     }
 
     // MARK: - CGEvent callback handler
@@ -120,12 +100,19 @@ final class HotkeyManager {
     fileprivate func handleFlagsChanged(_ event: CGEvent) {
         let flags = event.flags
         let active = flags.contains(.maskControl) && flags.contains(.maskAlternate)
+        processKeyState(active)
+    }
 
+    // MARK: - Shared key state logic
+
+    private func processKeyState(_ active: Bool) {
         if active && !keyIsDown {
             keyIsDown = true
+            debugLog("HOTKEY DOWN — ⌃⌥ held")
             DispatchQueue.main.async { self.onKeyDown?() }
         } else if !active && keyIsDown {
             keyIsDown = false
+            debugLog("HOTKEY UP — ⌃⌥ released")
             DispatchQueue.main.async { self.onKeyUp?() }
         }
     }

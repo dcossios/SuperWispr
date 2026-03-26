@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 import os
 
 /// Manages the Python transcription server as a child process.
@@ -6,6 +7,7 @@ final class ServerManager {
     private var process: Process?
     private var restartCount = 0
     private let maxRestarts = 3
+    private var usingExternalServer = false
     private let logger = Logger(subsystem: "com.superwispr", category: "ServerManager")
     private let serverURL = URL(string: "http://127.0.0.1:9876")!
     private var logFileHandle: FileHandle?
@@ -14,6 +16,21 @@ final class ServerManager {
 
     func start() {
         guard !isRunning else { return }
+        usingExternalServer = false
+
+        if checkHealthSync(timeout: 0.6) {
+            usingExternalServer = true
+            restartCount = 0
+            logger.info("Reusing existing local server on port 9876.")
+            return
+        }
+
+        if isPortInUse(host: "127.0.0.1", port: 9876) {
+            usingExternalServer = true
+            restartCount = 0
+            logger.info("Port 9876 already in use; waiting for existing server to become healthy.")
+            return
+        }
 
         let pythonPath = UserDefaults.standard.string(forKey: "pythonPath")
             ?? findPython()
@@ -33,6 +50,12 @@ final class ServerManager {
                           "--log-level", "info"]
         proc.currentDirectoryURL = URL(fileURLWithPath: serverDir)
 
+        var env = ProcessInfo.processInfo.environment
+        let extraPaths = ["/opt/homebrew/bin", "/usr/local/bin"]
+        let currentPath = env["PATH"] ?? "/usr/bin:/bin"
+        env["PATH"] = (extraPaths + [currentPath]).joined(separator: ":")
+        proc.environment = env
+
         if let logURL {
             let outHandle = try? FileHandle(forWritingTo: logURL)
             outHandle?.seekToEndOfFile()
@@ -49,6 +72,7 @@ final class ServerManager {
         do {
             try proc.run()
             process = proc
+            restartCount = 0
             logger.info("Server started (pid \(proc.processIdentifier))")
         } catch {
             logger.error("Failed to start server: \(error.localizedDescription)")
@@ -58,13 +82,20 @@ final class ServerManager {
     func waitUntilReady() async -> Bool {
         for attempt in 1...15 {
             try? await Task.sleep(nanoseconds: 1_000_000_000)
-            if await checkHealth() { return true }
+            if await checkHealth() {
+                restartCount = 0
+                return true
+            }
             logger.info("Health check attempt \(attempt)/15 …")
         }
         return false
     }
 
     func stop() {
+        if usingExternalServer {
+            logger.info("Leaving external server running.")
+            usingExternalServer = false
+        }
         guard let proc = process, proc.isRunning else {
             process = nil
             logFileHandle?.closeFile()
@@ -127,17 +158,85 @@ final class ServerManager {
         }
     }
 
-    private func handleTermination() {
-        guard restartCount < maxRestarts else {
-            logger.error("Server crashed \(self.maxRestarts) times. Giving up.")
-            Task { @MainActor in
-                AppState.shared.recordingState = .error("Server crashed repeatedly.")
+    private func checkHealthSync(timeout: TimeInterval) -> Bool {
+        let semaphore = DispatchSemaphore(value: 0)
+        var isHealthy = false
+        let url = serverURL.appendingPathComponent("health")
+
+        var request = URLRequest(url: url)
+        request.timeoutInterval = timeout
+
+        let task = URLSession.shared.dataTask(with: request) { data, response, _ in
+            defer { semaphore.signal() }
+            guard let http = response as? HTTPURLResponse, http.statusCode == 200,
+                  let data,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let status = json["status"] as? String else {
+                return
             }
-            return
+            isHealthy = (status == "ok")
         }
-        restartCount += 1
-        logger.info("Restarting server (attempt \(self.restartCount)/\(self.maxRestarts))")
-        start()
+        task.resume()
+        _ = semaphore.wait(timeout: .now() + timeout)
+        return isHealthy
+    }
+
+    private func handleTermination() {
+        // If another process is already serving on localhost:9876, don't fight it.
+        Task {
+            if await checkHealth() {
+                self.process = nil
+                self.restartCount = 0
+                self.usingExternalServer = true
+                self.logger.info("Detected healthy external server on port 9876; reusing it.")
+                return
+            }
+
+            if self.isPortInUse(host: "127.0.0.1", port: 9876) {
+                self.process = nil
+                self.restartCount = 0
+                self.usingExternalServer = true
+                self.logger.info("Port 9876 is occupied by another process; waiting for health.")
+                return
+            }
+
+            guard self.restartCount < self.maxRestarts else {
+                self.logger.error("Server crashed \(self.maxRestarts) times. Giving up.")
+                await MainActor.run {
+                    AppState.shared.recordingState = .error("Server crashed repeatedly.")
+                }
+                return
+            }
+
+            self.restartCount += 1
+            self.logger.info("Restarting server (attempt \(self.restartCount)/\(self.maxRestarts))")
+            self.start()
+        }
+    }
+
+    private func isPortInUse(host: String, port: UInt16) -> Bool {
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        if fd < 0 { return false }
+        defer { close(fd) }
+
+        var addr = sockaddr_in()
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = port.bigEndian
+        host.withCString { ptr in
+            _ = inet_pton(AF_INET, ptr, &addr.sin_addr)
+        }
+
+        var sockAddr = sockaddr()
+        memcpy(&sockAddr, &addr, MemoryLayout<sockaddr_in>.size)
+
+        let bindResult = withUnsafePointer(to: &sockAddr) { ptr -> Int32 in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saPtr in
+                Darwin.bind(fd, saPtr, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+
+        return bindResult == -1 && errno == EADDRINUSE
     }
 
     private func findPython() -> String? {

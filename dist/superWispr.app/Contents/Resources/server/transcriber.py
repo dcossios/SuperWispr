@@ -67,7 +67,7 @@ class Transcriber:
             chunk_length_s=30,
             batch_size=BATCH_SIZE,
             return_timestamps=True,
-            generate_kwargs=generate_kwargs if generate_kwargs else None,
+            generate_kwargs=generate_kwargs,
         )
 
         elapsed = time.monotonic() - start

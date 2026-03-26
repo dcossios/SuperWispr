@@ -9,6 +9,7 @@ struct SettingsView: View {
     @AppStorage("soundFeedback") private var soundFeedback = true
     @AppStorage("launchAtLogin") private var launchAtLogin = false
     @AppStorage("pythonPath") private var pythonPath = ""
+    @AppStorage("autoPasteShortcut") private var autoPasteShortcut = "cmd_v"
 
     @StateObject private var appState = AppState.shared
     @State private var isSwappingModel = false
@@ -82,6 +83,17 @@ struct SettingsView: View {
                 Text("Hold **⌃⌥** (Control + Option) to record")
                     .foregroundStyle(.secondary)
                     .font(.callout)
+
+                Picker("Auto-paste shortcut", selection: $autoPasteShortcut) {
+                    Text("Cmd+V").tag("cmd_v")
+                    Text("Cmd+Shift+V").tag("cmd_shift_v")
+                    Text("Cmd+Option+V").tag("cmd_opt_v")
+                    Text("Cmd+Option+Shift+V").tag("cmd_opt_shift_v")
+                }
+
+                Text("Command sent after transcription for automatic paste.")
+                    .foregroundStyle(.secondary)
+                    .font(.caption)
             }
 
             Section("General") {
